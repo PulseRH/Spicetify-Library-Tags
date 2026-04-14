@@ -253,6 +253,61 @@ function findFilterFiberProps(): FilterFiberProps | null {
 
 let origGetContents: ((params: any) => Promise<any>) | null = null;
 
+// Flat-list cache — when a tag is active we recursively walk the folder tree,
+// which means one patched getContents call can fan out into many raw calls.
+// The virtualizer pages through getContents (different offset/limit each
+// call) as the user scrolls, so without caching we'd re-walk the whole tree
+// on every page. Keyed by folderUri + sorted activeTagIds. Short TTL so
+// library mutations outside the extension become visible quickly.
+interface FlatCacheEntry {
+  key: string;
+  ts: number;
+  items: any[];
+  envelope: any;
+}
+let flatCache: FlatCacheEntry | null = null;
+const FLAT_CACHE_TTL_MS = 3000;
+
+function flatCacheKey(params: any): string {
+  const folder = params?.folderUri || "";
+  const tags = Array.from(activeTagIds).sort().join(",");
+  return folder + "::" + tags;
+}
+
+function invalidateFlatCache() {
+  flatCache = null;
+}
+
+// Recursively collect playlist items under a folder. Folders are "unfolded"
+// — only their playlist descendants appear in the result. Non-playlist items
+// inside a folder (rare / shouldn't exist) are ignored at this depth.
+async function collectFromFolder(folderUri: string, baseParams: any): Promise<any[]> {
+  if (!origGetContents) return [];
+  const res = await origGetContents({
+    ...baseParams,
+    folderUri,
+    offset: 0,
+    limit: 10000,
+  });
+  const out: any[] = [];
+  const subfolders: any[] = [];
+  for (const item of res?.items || []) {
+    if (!item) continue;
+    if (item.type === "folder") {
+      subfolders.push(item);
+    } else if (item.type === "playlist") {
+      const assigned = store.getAssignments(item.uri);
+      if (assigned.some((tid) => activeTagIds.has(tid))) out.push(item);
+    }
+  }
+  // Parallelize sibling-folder recursion so N folders costs ~one roundtrip.
+  const subResults = await Promise.all(
+    subfolders.map((f) => collectFromFolder(f.uri, baseParams))
+  );
+  for (const arr of subResults) out.push(...arr);
+  return out;
+}
+
 function installGetContentsPatch() {
   const api = Spicetify.Platform.LibraryAPI;
   if (!api || origGetContents) return;
@@ -263,33 +318,61 @@ function installGetContentsPatch() {
       return origGetContents ? origGetContents(params) : api.__proto__.getContents.call(api, params);
     }
 
-    // Fetch the full set so we can filter and re-paginate ourselves.
-    // The virtualizer needs accurate totalLength to size the scroll area.
-    const full = await origGetContents({
-      ...params,
-      offset: 0,
-      limit: 10000,
-    });
+    // Serve from cache if fresh — same folder scope + same active tags.
+    const key = flatCacheKey(params);
+    const now = Date.now();
+    let flat: any[];
+    let envelope: any;
 
-    const items = (full?.items || []).filter((item: any) => {
-      if (!item) return false;
-      // Folders pass through unconditionally so navigation still works.
-      // Non-playlist items also pass — our tag filter only constrains playlists.
-      // (Activating a tag while viewing Artists still shows artists normally.)
-      if (item.type !== "playlist") return true;
-      const assigned = store.getAssignments(item.uri);
-      // OR semantics: any active tag match → include
-      return assigned.some((tid) => activeTagIds.has(tid));
-    });
+    if (flatCache && flatCache.key === key && now - flatCache.ts < FLAT_CACHE_TTL_MS) {
+      flat = flatCache.items;
+      envelope = flatCache.envelope;
+    } else {
+      // Fetch the current scope fully — gives us the response envelope
+      // (selectedFilters, availableFilters, etc.) plus the top-level items.
+      const top = await origGetContents({
+        ...params,
+        offset: 0,
+        limit: 10000,
+      });
+      envelope = top;
+
+      const collected: any[] = [];
+      const folders: any[] = [];
+      for (const item of top?.items || []) {
+        if (!item) continue;
+        if (item.type === "folder") {
+          // "Unfold" — don't include the folder itself; its playlists will be added via recursion.
+          folders.push(item);
+        } else if (item.type === "playlist") {
+          const assigned = store.getAssignments(item.uri);
+          // OR semantics: any active tag match → include
+          if (assigned.some((tid) => activeTagIds.has(tid))) collected.push(item);
+        } else {
+          // Non-playlist, non-folder items (albums, artists, etc.) pass
+          // through — our filter only constrains playlists.
+          collected.push(item);
+        }
+      }
+
+      // Parallel recursion into each folder in the current scope.
+      const folderResults = await Promise.all(
+        folders.map((f) => collectFromFolder(f.uri, params))
+      );
+      for (const arr of folderResults) collected.push(...arr);
+
+      flat = collected;
+      flatCache = { key, ts: now, items: flat, envelope };
+    }
 
     const offset = params?.offset || 0;
     const limitRaw = params?.limit;
-    const limit = typeof limitRaw === "number" ? limitRaw : items.length;
+    const limit = typeof limitRaw === "number" ? limitRaw : flat.length;
 
     return {
-      ...full,
-      items: items.slice(offset, offset + limit),
-      totalLength: items.length,
+      ...envelope,
+      items: flat.slice(offset, offset + limit),
+      totalLength: flat.length,
       offset,
       limit,
     };
@@ -760,9 +843,8 @@ function registerContextMenu() {
     const assignedItem = new Spicetify.ContextMenu.Item(
       label,
       (uris: string[]) => {
+        // store.subscribe triggers the refetch — no explicit call needed.
         store.unassign(uris, tag.id);
-        // If this tag is active, re-filter the library.
-        if (activeTagIds.has(tag.id)) forceLibraryRefetch();
       },
       (uris: string[]) => isTaggable(uris) && uris.every((u) => store.hasTag(u, tag.id)),
       Spicetify.SVGIcons?.check || undefined
@@ -772,8 +854,8 @@ function registerContextMenu() {
     const unassignedItem = new Spicetify.ContextMenu.Item(
       label,
       (uris: string[]) => {
+        // store.subscribe triggers the refetch — no explicit call needed.
         store.assign(uris, tag.id);
-        if (activeTagIds.has(tag.id)) forceLibraryRefetch();
       },
       (uris: string[]) => isTaggable(uris) && !uris.every((u) => store.hasTag(u, tag.id))
     );
@@ -789,8 +871,8 @@ function registerContextMenu() {
         openTagEditor({
           title: "Create tag",
           onDone: (tag) => {
+            // store.subscribe will invalidate the cache + refetch if needed.
             store.assign(uris, tag.id);
-            if (activeTagIds.size > 0) forceLibraryRefetch();
           },
         });
       },
@@ -949,6 +1031,13 @@ async function main() {
   store.subscribe(() => {
     registerContextMenu();
     if (currentListbox) renderAllChips(currentListbox);
+    // Tag/assignment edits may change what the flatten cache would return
+    // under the same (folderUri + activeTagIds) key; evict so the next
+    // getContents call rebuilds.
+    invalidateFlatCache();
+    // If a tag filter is currently active and the user just toggled an
+    // assignment, re-query so the grid reflects the new membership.
+    if (activeTagIds.size > 0) forceLibraryRefetch();
   });
 
   // Poll for the filter listbox — it's destroyed/recreated on navigation.
