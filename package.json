@@ -1,0 +1,19 @@
+{
+  "name": "library-tags",
+  "version": "1.0.0",
+  "description": "Spicetify extension that adds colored tags to playlists and folders, with filter pills in the library",
+  "scripts": {
+    "build": "spicetify-creator",
+    "build:local": "spicetify-creator --out=dist",
+    "watch": "spicetify-creator --watch"
+  },
+  "keywords": ["spicetify", "extension", "tags", "library"],
+  "author": "Loz",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/react": "^19.2.14",
+    "spicetify-creator": "^1.0.17",
+    "typescript": "^5.9.3",
+    "ws": "^8.18.0"
+  }
+}
