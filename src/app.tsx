@@ -416,10 +416,7 @@ function installGetContentsPatch() {
 // Force library refetch (lifted)
 // ============================================================
 
-const PLAYLIST_FILTER_ID = "2";
-const BY_YOU_FILTER_ID = "102";
-const BY_SPOTIFY_FILTER_ID = "103";
-const REFETCH_CANDIDATES = ["0", "1", "3", "4"]; // Albums, Artists, Podcasts, Audiobooks
+const DOWNLOADED_FILTER_ID = "100";
 
 function getCurrentFilterIds(): string[] {
   const props = findFilterFiberProps();
@@ -445,27 +442,40 @@ function waitForFilterChange(baseline: string[], maxMs = 500, stepMs = 15): Prom
   });
 }
 
+// Toggle "Downloaded" on then off to force a getContents refetch without
+// disturbing the user's top-level filter selection. Top-level filters
+// (Albums, Artists, Playlists, Podcasts, Audiobooks) are mutually exclusive
+// in the current client — toggling an unrelated one replaces the active
+// one, so we can't use them as a refetch vehicle. Downloaded is a
+// sub-filter that coexists with any top-level selection.
 async function forceLibraryRefetch() {
   const p1 = findFilterFiberProps();
   if (!p1?.toggleFilterId) return;
 
-  const currentIds = new Set(getCurrentFilterIds());
-  const inFolder = !currentIds.has(PLAYLIST_FILTER_ID);
-  const candidates = inFolder
-    ? [BY_YOU_FILTER_ID, BY_SPOTIFY_FILTER_ID, ...REFETCH_CANDIDATES]
-    : [...REFETCH_CANDIDATES, BY_YOU_FILTER_ID, BY_SPOTIFY_FILTER_ID];
-  const toggleTarget = candidates.find((id) => !currentIds.has(id)) || candidates[0];
-
   try {
-    const before = getCurrentFilterIds();
-    p1.toggleFilterId(toggleTarget);
+    const snapshot = getCurrentFilterIds();
+    const hadDownloaded = snapshot.includes(DOWNLOADED_FILTER_ID);
+
+    // First toggle: if Downloaded was already on, turn it off; otherwise on.
+    const before = snapshot;
+    p1.toggleFilterId(DOWNLOADED_FILTER_ID);
     await waitForFilterChange(before);
 
+    // Second toggle: restore Downloaded to its original state.
     const p2 = findFilterFiberProps();
     if (p2?.toggleFilterId) {
       const mid = getCurrentFilterIds();
-      p2.toggleFilterId(toggleTarget);
+      p2.toggleFilterId(DOWNLOADED_FILTER_ID);
       await waitForFilterChange(mid);
+    }
+
+    // Defensive: if we somehow didn't return to the original state, try
+    // one more toggle to normalize.
+    const final = getCurrentFilterIds();
+    const finalHasDownloaded = final.includes(DOWNLOADED_FILTER_ID);
+    if (finalHasDownloaded !== hadDownloaded) {
+      const p3 = findFilterFiberProps();
+      if (p3?.toggleFilterId) p3.toggleFilterId(DOWNLOADED_FILTER_ID);
     }
   } catch (e) {
     console.error("[library-tags] forceLibraryRefetch failed:", e);
@@ -535,7 +545,7 @@ function buildOneChip(tag: Tag, styles: ChipStyles): HTMLElement {
   // Left click → toggle active; right click → tag-pill mini-menu
   optionDiv.addEventListener(
     "pointerdown",
-    (e) => {
+    async (e) => {
       if ((e as PointerEvent).button !== 0) return; // only left click
       e.preventDefault();
       e.stopImmediatePropagation();
@@ -543,7 +553,11 @@ function buildOneChip(tag: Tag, styles: ChipStyles): HTMLElement {
       if (activeTagIds.has(tag.id)) activeTagIds.delete(tag.id);
       else activeTagIds.add(tag.id);
       setChipVisual(chipDiv, span, activeTagIds.has(tag.id), styles);
-      forceLibraryRefetch();
+      invalidateFlatCache();
+      await forceLibraryRefetch();
+      // Spotify may have rebuilt the listbox during the refetch — re-render
+      // our chips so every pill reflects the current activeTagIds state.
+      if (currentListbox) renderAllChips(currentListbox);
     },
     true
   );
