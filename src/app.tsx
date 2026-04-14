@@ -348,11 +348,10 @@ function installGetContentsPatch() {
           const assigned = store.getAssignments(item.uri);
           // OR semantics: any active tag match → include
           if (assigned.some((tid) => activeTagIds.has(tid))) collected.push(item);
-        } else {
-          // Non-playlist, non-folder items (albums, artists, etc.) pass
-          // through — our filter only constrains playlists.
-          collected.push(item);
         }
+        // Non-playlist, non-folder items (albums, singles, artists, podcasts)
+        // are dropped — when a tag filter is active the view is strictly
+        // "tagged playlists only".
       }
 
       // Parallel recursion into each folder in the current scope.
