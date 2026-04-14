@@ -253,12 +253,11 @@ function findFilterFiberProps(): FilterFiberProps | null {
 
 let origGetContents: ((params: any) => Promise<any>) | null = null;
 
-// Flat-list cache — when a tag is active we recursively walk the folder tree,
-// which means one patched getContents call can fan out into many raw calls.
-// The virtualizer pages through getContents (different offset/limit each
-// call) as the user scrolls, so without caching we'd re-walk the whole tree
-// on every page. Keyed by folderUri + sorted activeTagIds. Short TTL so
-// library mutations outside the extension become visible quickly.
+// Flat-list cache — when a tag is active we enumerate every playlist in the
+// library via RootlistAPI, look up rich item shapes from LibraryAPI, then
+// filter by assignments. The virtualizer pages through getContents as the
+// user scrolls (different offset/limit each call), so caching the flat
+// result avoids redoing the whole enumeration on each page.
 interface FlatCacheEntry {
   key: string;
   ts: number;
@@ -268,44 +267,86 @@ interface FlatCacheEntry {
 let flatCache: FlatCacheEntry | null = null;
 const FLAT_CACHE_TTL_MS = 3000;
 
-function flatCacheKey(params: any): string {
-  const folder = params?.folderUri || "";
-  const tags = Array.from(activeTagIds).sort().join(",");
-  return folder + "::" + tags;
+function flatCacheKey(): string {
+  // No folderUri in the key — when a tag is active the view is library-wide
+  // regardless of which folder the user has navigated into.
+  return "flat::" + Array.from(activeTagIds).sort().join(",");
 }
 
 function invalidateFlatCache() {
   flatCache = null;
 }
 
-// Recursively collect playlist items under a folder. Folders are "unfolded"
-// — only their playlist descendants appear in the result. Non-playlist items
-// inside a folder (rare / shouldn't exist) are ignored at this depth.
-async function collectFromFolder(folderUri: string, baseParams: any): Promise<any[]> {
-  if (!origGetContents) return [];
-  const res = await origGetContents({
-    ...baseParams,
-    folderUri,
-    offset: 0,
-    limit: 10000,
-  });
+// Walk RootlistAPI's nested tree and return every playlist entry. This is
+// how sort-by-others discovers library-wide URIs; LibraryAPI.getContents
+// with folderUri was unreliable in practice (folder-interior playlists
+// didn't consistently surface), so we use RootlistAPI as the source of
+// truth for which playlists exist.
+async function enumerateAllPlaylistsViaRootlist(): Promise<any[]> {
+  const rootlist = await Spicetify.Platform.RootlistAPI.getContents();
   const out: any[] = [];
-  const subfolders: any[] = [];
-  for (const item of res?.items || []) {
-    if (!item) continue;
-    if (item.type === "folder") {
-      subfolders.push(item);
-    } else if (item.type === "playlist") {
-      const assigned = store.getAssignments(item.uri);
-      if (assigned.some((tid) => activeTagIds.has(tid))) out.push(item);
+  function walk(items: any[]) {
+    for (const item of items || []) {
+      if (!item) continue;
+      if (item.type === "folder" && item.items) walk(item.items);
+      else if (item.type === "playlist") out.push(item);
     }
   }
-  // Parallelize sibling-folder recursion so N folders costs ~one roundtrip.
-  const subResults = await Promise.all(
-    subfolders.map((f) => collectFromFolder(f.uri, baseParams))
-  );
-  for (const arr of subResults) out.push(...arr);
+  walk(rootlist?.items || []);
   return out;
+}
+
+// Build a map of uri → rich LibraryAPI item shape by calling origGetContents
+// with filters set to just Playlists (id=2) at limit 10000. This returns
+// root-level playlists + folders; folders are entered to collect their
+// descendants. Any URIs we can't find this way fall back to the RootlistAPI
+// item shape (minimal fields — name, uri, owner — which still renders,
+// though without artwork in some spots).
+async function buildItemShapeIndex(): Promise<Map<string, any>> {
+  const index = new Map<string, any>();
+  if (!origGetContents) return index;
+
+  async function absorb(items: any[]) {
+    for (const item of items || []) {
+      if (!item) continue;
+      if (item.type === "playlist" && item.uri) {
+        index.set(item.uri, item);
+      }
+    }
+  }
+
+  // Root call with Playlists filter — the richest shape we can reliably get.
+  try {
+    const rootRes = await origGetContents({
+      filters: ["2"],
+      offset: 0,
+      limit: 10000,
+    });
+    await absorb(rootRes?.items || []);
+
+    // Recurse into any folders the root call surfaced.
+    const folders = (rootRes?.items || []).filter((i: any) => i?.type === "folder");
+    const folderResults = await Promise.all(
+      folders.map(async (f: any) => {
+        try {
+          const r = await origGetContents!({
+            filters: ["2"],
+            folderUri: f.uri,
+            offset: 0,
+            limit: 10000,
+          });
+          return r?.items || [];
+        } catch {
+          return [];
+        }
+      })
+    );
+    for (const arr of folderResults) await absorb(arr);
+  } catch (e) {
+    console.warn("[library-tags] buildItemShapeIndex: LibraryAPI fetch failed, will fall back to RootlistAPI shapes:", e);
+  }
+
+  return index;
 }
 
 function installGetContentsPatch() {
@@ -318,8 +359,9 @@ function installGetContentsPatch() {
       return origGetContents ? origGetContents(params) : api.__proto__.getContents.call(api, params);
     }
 
-    // Serve from cache if fresh — same folder scope + same active tags.
-    const key = flatCacheKey(params);
+    // Serve from cache if fresh. Key is tag-only — a tag-active view is
+    // library-wide regardless of which folder the user is in.
+    const key = flatCacheKey();
     const now = Date.now();
     let flat: any[];
     let envelope: any;
@@ -328,37 +370,29 @@ function installGetContentsPatch() {
       flat = flatCache.items;
       envelope = flatCache.envelope;
     } else {
-      // Fetch the current scope fully — gives us the response envelope
-      // (selectedFilters, availableFilters, etc.) plus the top-level items.
-      const top = await origGetContents({
-        ...params,
-        offset: 0,
-        limit: 10000,
-      });
-      envelope = top;
+      // Discover EVERY playlist in the library (including inside folders)
+      // via RootlistAPI, then enrich with LibraryAPI item shapes where
+      // available for better rendering.
+      const [allPlaylists, shapeIndex] = await Promise.all([
+        enumerateAllPlaylistsViaRootlist(),
+        buildItemShapeIndex(),
+      ]);
 
       const collected: any[] = [];
-      const folders: any[] = [];
-      for (const item of top?.items || []) {
-        if (!item) continue;
-        if (item.type === "folder") {
-          // "Unfold" — don't include the folder itself; its playlists will be added via recursion.
-          folders.push(item);
-        } else if (item.type === "playlist") {
-          const assigned = store.getAssignments(item.uri);
-          // OR semantics: any active tag match → include
-          if (assigned.some((tid) => activeTagIds.has(tid))) collected.push(item);
-        }
-        // Non-playlist, non-folder items (albums, singles, artists, podcasts)
-        // are dropped — when a tag filter is active the view is strictly
-        // "tagged playlists only".
+      for (const pl of allPlaylists) {
+        const assigned = store.getAssignments(pl.uri);
+        if (!assigned.some((tid) => activeTagIds.has(tid))) continue;
+        // Prefer the richer LibraryAPI shape; fall back to RootlistAPI item.
+        collected.push(shapeIndex.get(pl.uri) || pl);
       }
 
-      // Parallel recursion into each folder in the current scope.
-      const folderResults = await Promise.all(
-        folders.map((f) => collectFromFolder(f.uri, params))
-      );
-      for (const arr of folderResults) collected.push(...arr);
+      // Get a valid envelope so selectedFilters/availableFilters stay coherent.
+      // Use the caller's exact params so the chip UI doesn't flip state.
+      try {
+        envelope = await origGetContents({ ...params, offset: 0, limit: 1 });
+      } catch {
+        envelope = {};
+      }
 
       flat = collected;
       flatCache = { key, ts: now, items: flat, envelope };
