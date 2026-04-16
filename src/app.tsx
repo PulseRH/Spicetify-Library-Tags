@@ -172,6 +172,12 @@ interface ChipStyles {
 let cachedStyles: ChipStyles | null = null;
 
 function getChipStyles(listbox: Element): ChipStyles | null {
+  // Once we've computed styles from a listbox that exposes both selected
+  // and unselected chips, keep them forever — subsequent listboxes may
+  // only show one state (e.g., inside a folder), which would make a naive
+  // string-replace fallback produce identical classes for both states.
+  if (cachedStyles) return cachedStyles;
+
   const isOurChip = (el: Element) => {
     const id = el.closest('[role="option"]')?.id || "";
     return id.startsWith(CHIP_PREFIX);
@@ -187,31 +193,24 @@ function getChipStyles(listbox: Element): ChipStyles | null {
   if (unselected && selected) {
     const us = unselected.querySelector("span");
     const ss = selected.querySelector("span");
-    if (us && ss) {
+    if (us && ss && unselected.className !== selected.className) {
       cachedStyles = {
         chipClass: unselected.className,
         spanClass: us.className,
         selectedChipClass: selected.className,
         selectedSpanClass: ss.className,
       };
+      return cachedStyles;
     }
   }
 
-  if (cachedStyles) return cachedStyles;
-
-  const chip =
-    unselected ||
-    selected ||
-    Array.from(listbox.querySelectorAll('[data-encore-id="chip"]')).find((el) => !isOurChip(el));
-  if (!chip) return null;
-  const span = chip.querySelector("span");
-  if (!span) return null;
-  return {
-    chipClass: chip.className,
-    spanClass: span.className,
-    selectedChipClass: chip.className.replace("-sm-", "-sm-selected-"),
-    selectedSpanClass: span.className.replace("ChipInnerComponent-sm ", "ChipInnerComponent-sm-selected "),
-  };
+  // No full pair available yet. Return null — buildOneChip will skip this
+  // render cycle and the next scan (triggered by listbox mutations or
+  // the 500ms poll) will retry once both states are present. We don't
+  // synthesize partial styles here because the old fallback produced
+  // selectedChipClass === chipClass when the only visible chip was
+  // already in the target state, causing every tag pill to look selected.
+  return null;
 }
 
 function setChipVisual(chipEl: Element, spanEl: Element, active: boolean, styles: ChipStyles) {
@@ -496,20 +495,59 @@ async function downloadedToggleRefetch() {
   }
 }
 
+const LIBRARY_PLAYLISTS_PATH = "/collection/playlists";
+
+// Navigate to the main library playlists view. Returns true if navigation
+// was actually attempted (pathname differed). This is the preferred
+// refetch path because it unambiguously triggers a React re-render of
+// the list container (getContents is called on mount/nav) AND exits any
+// folder context, which is important because folder views use a
+// different data path that bypasses our getContents patch.
+function tryNavigationRefetch(): boolean {
+  try {
+    const history = Spicetify.Platform?.History;
+    if (!history?.push) return false;
+    const location = history.location || {};
+    const currentPath: string = location.pathname || "";
+    if (currentPath !== LIBRARY_PLAYLISTS_PATH) {
+      history.push(LIBRARY_PLAYLISTS_PATH);
+      return true;
+    }
+    // Already there — replace with fresh state object to nudge React
+    // Router listeners that key on the location identity.
+    if (typeof history.replace === "function") {
+      history.replace({
+        ...location,
+        state: { __libraryTagsRefresh: Date.now() },
+      });
+      return true;
+    }
+  } catch (e) {
+    console.warn("[library-tags] navigation refetch failed:", e);
+  }
+  return false;
+}
+
 async function forceLibraryRefetch() {
   invalidateFlatCache();
   const before = getContentsCallCount;
 
+  // Strategy 1: navigation (silent, and exits folders).
+  const navigated = tryNavigationRefetch();
+  if (navigated) {
+    await new Promise((r) => setTimeout(r, 200));
+    if (getContentsCallCount > before) return;
+  }
+
+  // Strategy 2: event emit on the LibraryAPI event bus.
   if (tryEventBasedRefetch()) {
-    // Give the UI a moment to react to the event. If it triggers a
-    // getContents call, we're done — no chip toggling needed.
     await new Promise((r) => setTimeout(r, 150));
     if (getContentsCallCount > before) return;
   }
 
-  // Event emit didn't produce a refetch — fall back to the Downloaded
-  // toggle as a last resort. This will briefly flash the Downloaded
-  // chip but is the only way we know to force a refetch otherwise.
+  // Last resort: visible Downloaded-chip toggle. This flashes briefly
+  // but guarantees the feature still works on client versions where
+  // neither navigation nor event emit nudges the container.
   await downloadedToggleRefetch();
 }
 
@@ -1125,7 +1163,11 @@ async function main() {
     const lb = document.querySelector('[role="listbox"][aria-label="Filter options"]');
     if (lb && lb !== currentListbox) {
       currentListbox = lb;
-      cachedStyles = null; // fresh listbox → re-read styles
+      // Keep cachedStyles across listbox swaps. Inside a folder the new
+      // listbox may only expose one of the selected/unselected states at
+      // the moment we read it, which makes the string-replace fallback
+      // produce identical classes (every chip looks selected). The styles
+      // we captured from the main library view are still valid — reuse them.
       startChipLifecycleObserver(lb);
     } else if (!lb && currentListbox) {
       currentListbox = null;
