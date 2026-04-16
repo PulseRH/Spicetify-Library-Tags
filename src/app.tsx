@@ -252,6 +252,7 @@ function findFilterFiberProps(): FilterFiberProps | null {
 // ============================================================
 
 let origGetContents: ((params: any) => Promise<any>) | null = null;
+let getContentsCallCount = 0;
 
 // Flat-list cache — when a tag is active we enumerate every playlist in the
 // library via RootlistAPI, look up rich item shapes from LibraryAPI, then
@@ -355,6 +356,7 @@ function installGetContentsPatch() {
   origGetContents = api.getContents.bind(api);
 
   api.getContents = async function (params: any) {
+    getContentsCallCount++;
     if (activeTagIds.size === 0 || !origGetContents) {
       return origGetContents ? origGetContents(params) : api.__proto__.getContents.call(api, params);
     }
@@ -442,13 +444,30 @@ function waitForFilterChange(baseline: string[], maxMs = 500, stepMs = 15): Prom
   });
 }
 
-// Toggle "Downloaded" on then off to force a getContents refetch without
-// disturbing the user's top-level filter selection. Top-level filters
-// (Albums, Artists, Playlists, Podcasts, Audiobooks) are mutually exclusive
-// in the current client — toggling an unrelated one replaces the active
-// one, so we can't use them as a refetch vehicle. Downloaded is a
-// sub-filter that coexists with any top-level selection.
-async function forceLibraryRefetch() {
+// Emit an "update" event on the LibraryAPI's internal emitter — the same
+// signal Spotify fires when a playlist is added/removed. The list
+// container subscribes to this and will re-call getContents, giving us
+// a refetch with no visible filter-chip side effects.
+function tryEventBasedRefetch(): boolean {
+  try {
+    const api = Spicetify.Platform.LibraryAPI;
+    const events = api?._events;
+    if (!events?.emit) return false;
+    // Try a few event shapes — different client versions listen for
+    // different ones. Emitting is cheap; unlisted events are no-ops.
+    events.emit("update", { type: "library-tags:refetch" });
+    events.emit("operation_complete", { type: "library-tags:refetch" });
+    return true;
+  } catch (e) {
+    console.warn("[library-tags] event-based refetch failed:", e);
+    return false;
+  }
+}
+
+// Fallback only: toggle "Downloaded" (a sub-filter that coexists with any
+// top-level selection) on-then-off. Top-level filters are mutually
+// exclusive so we can't use them as a refetch vehicle.
+async function downloadedToggleRefetch() {
   const p1 = findFilterFiberProps();
   if (!p1?.toggleFilterId) return;
 
@@ -456,12 +475,10 @@ async function forceLibraryRefetch() {
     const snapshot = getCurrentFilterIds();
     const hadDownloaded = snapshot.includes(DOWNLOADED_FILTER_ID);
 
-    // First toggle: if Downloaded was already on, turn it off; otherwise on.
     const before = snapshot;
     p1.toggleFilterId(DOWNLOADED_FILTER_ID);
     await waitForFilterChange(before);
 
-    // Second toggle: restore Downloaded to its original state.
     const p2 = findFilterFiberProps();
     if (p2?.toggleFilterId) {
       const mid = getCurrentFilterIds();
@@ -469,17 +486,31 @@ async function forceLibraryRefetch() {
       await waitForFilterChange(mid);
     }
 
-    // Defensive: if we somehow didn't return to the original state, try
-    // one more toggle to normalize.
     const final = getCurrentFilterIds();
-    const finalHasDownloaded = final.includes(DOWNLOADED_FILTER_ID);
-    if (finalHasDownloaded !== hadDownloaded) {
+    if (final.includes(DOWNLOADED_FILTER_ID) !== hadDownloaded) {
       const p3 = findFilterFiberProps();
       if (p3?.toggleFilterId) p3.toggleFilterId(DOWNLOADED_FILTER_ID);
     }
   } catch (e) {
-    console.error("[library-tags] forceLibraryRefetch failed:", e);
+    console.error("[library-tags] downloadedToggleRefetch failed:", e);
   }
+}
+
+async function forceLibraryRefetch() {
+  invalidateFlatCache();
+  const before = getContentsCallCount;
+
+  if (tryEventBasedRefetch()) {
+    // Give the UI a moment to react to the event. If it triggers a
+    // getContents call, we're done — no chip toggling needed.
+    await new Promise((r) => setTimeout(r, 150));
+    if (getContentsCallCount > before) return;
+  }
+
+  // Event emit didn't produce a refetch — fall back to the Downloaded
+  // toggle as a last resort. This will briefly flash the Downloaded
+  // chip but is the only way we know to force a refetch otherwise.
+  await downloadedToggleRefetch();
 }
 
 // ============================================================
