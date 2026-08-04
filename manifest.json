@@ -1,0 +1,14 @@
+ {
+    "name": "Library Tags",
+    "description": "Tag your playlists with coloured labels and filter your library by them.",
+    "main": "library-tags.js",
+    "preview": "assets/library-tags.png",
+    "readme": "README.md",
+    "authors": [
+      {
+        "name": "PulseRH",
+        "url": "https://github.com/PulseRH"
+      }
+    ],
+    "tags": ["library", "playlists", "organisation"]
+  }
